@@ -1,36 +1,62 @@
 from __future__ import annotations
-import json
+import logging
 from pathlib import Path
 
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+from homeassistant.core import CoreState, Event, HomeAssistant
+from homeassistant.loader import async_get_integration
 
+_LOGGER = logging.getLogger(__name__)
+
+DOMAIN = "rolling_weather"
 PLATFORMS = ["sensor"]
 JS_BASE_URL = "/rolling_weather/rolling-weather-card.js"
 
 
-def _get_version() -> str:
-    try:
-        manifest_path = Path(__file__).parent / "manifest.json"
-        with open(manifest_path, encoding="utf-8") as f:
-            return json.load(f).get("version", "1.0.0")
-    except Exception:
-        return "1.0.0"
-
-
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     js_path = Path(__file__).parent / "www" / "rolling-weather-card.js"
-    
-    # Append version as a cache buster (e.g., /rolling_weather/rolling-weather-card.js?v=1.0.2)
-    version = _get_version()
-    js_url_with_cache_buster = f"{JS_BASE_URL}?v={version}"
+
+    # Fetch the version from HA's cached integration metadata (non-blocking)
+    integration = await async_get_integration(hass, DOMAIN)
+    version = str(integration.version or "1.0.0")
+    versioned_url = f"{JS_BASE_URL}?v={version}"
 
     await hass.http.async_register_static_paths([
         StaticPathConfig(JS_BASE_URL, str(js_path), cache_headers=False)
     ])
-    add_extra_js_url(hass, js_url_with_cache_buster)
+
+    async def _sync_lovelace_resource(_event: Event | None = None) -> None:
+        lovelace = hass.data.get("lovelace")
+        mode = getattr(lovelace, "mode", None) or getattr(lovelace, "resource_mode", None)
+
+        if lovelace is not None and mode == "storage":
+            resources = lovelace.resources
+            if not resources.loaded:
+                await resources.async_load()
+
+            existing = next(
+                (item for item in resources.async_items() if item.get("url", "").startswith(JS_BASE_URL)),
+                None,
+            )
+            if existing is None:
+                await resources.async_create_item({"res_type": "module", "url": versioned_url})
+                _LOGGER.info("Created Lovelace resource: %s", versioned_url)
+            elif existing.get("url") != versioned_url:
+                await resources.async_update_item(
+                    existing["id"], {"res_type": "module", "url": versioned_url}
+                )
+                _LOGGER.info("Updated Lovelace resource to: %s", versioned_url)
+        else:
+            add_extra_js_url(hass, versioned_url)
+
+    if hass.state is CoreState.running:
+        await _sync_lovelace_resource()
+    else:
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _sync_lovelace_resource)
+
     return True
 
 
