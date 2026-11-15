@@ -4,10 +4,15 @@ import logging
 
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+from homeassistant.core import CoreState, Event, HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.event import async_track_time_change, async_track_time_interval
+from homeassistant.helpers.event import (
+    async_track_state_change_event,
+    async_track_time_change,
+    async_track_time_interval,
+)
 from homeassistant.helpers.restore_state import RestoreEntity
 
 _LOGGER = logging.getLogger(__name__)
@@ -104,11 +109,36 @@ class RollingWeatherSensor(RestoreEntity, SensorEntity):
                 if val and val != "unknown":
                     self._data[slot] = val
 
-        # Backfill any missing past days via Open-Meteo
-        await self._async_backfill_missing_past_days()
+        async def _initial_sync(_event: Event | None = None) -> None:
+            await self._async_backfill_missing_past_days()
 
-        # Fetch today + future days from the selected HA weather entity
-        await self._async_fetch_forecast()
+            # If the weather entity isn't registered yet, wait for it to appear
+            if self.hass.states.get(self._weather_entity) is None:
+                _LOGGER.debug(
+                    "Waiting for %s to become available before fetching forecast",
+                    self._weather_entity,
+                )
+                unsub = None
+
+                @callback
+                def _on_weather_ready(event: Event) -> None:
+                    if unsub:
+                        unsub()
+                    self.hass.async_create_task(self._async_fetch_forecast())
+
+                unsub = async_track_state_change_event(
+                    self.hass, [self._weather_entity], _on_weather_ready
+                )
+                self.async_on_remove(unsub)
+                self.async_write_ha_state()
+                return
+
+            await self._async_fetch_forecast()
+
+        if self.hass.state is CoreState.running:
+            await _initial_sync()
+        else:
+            self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _initial_sync)
 
         # Shift days at 00:01:00 daily
         self.async_on_remove(
@@ -173,7 +203,10 @@ class RollingWeatherSensor(RestoreEntity, SensorEntity):
 
         lat, lon = self._resolve_coordinates()
         if lat is None or lon is None:
-            _LOGGER.warning("No coordinates found on %s or Home Assistant config; skipping Open-Meteo backfill", self._weather_entity)
+            _LOGGER.warning(
+                "No coordinates found on %s or Home Assistant config; skipping Open-Meteo backfill",
+                self._weather_entity,
+            )
             return
 
         url = (
