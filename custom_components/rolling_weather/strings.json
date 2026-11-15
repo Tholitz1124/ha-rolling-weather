@@ -1,0 +1,13 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Rolling 7-Day Weather",
+        "description": "Select the weather entity to track past days, today, and future days.",
+        "data": {
+          "weather_entity": "Weather Entity"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "domain": "rolling_weather",
+  "name": "Rolling 7-Day Weather",
+  "version": "1.0.0",
+  "config_flow": true,
+  "documentation": "https://github.com/Tholitz1124/ha-rolling-weather",
+  "dependencies": ["frontend", "http", "weather"],
+  "codeowners": ["@Tholitz1124"],
+  "iot_class": "calculated"
+}
