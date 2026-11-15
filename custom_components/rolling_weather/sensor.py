@@ -5,19 +5,23 @@ import logging
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_change, async_track_time_interval
 from homeassistant.helpers.restore_state import RestoreEntity
 
 _LOGGER = logging.getLogger(__name__)
 
-SLOTS = [
+PAST_SLOTS = [
     "day_minus_6",
     "day_minus_5",
     "day_minus_4",
     "day_minus_3",
     "day_minus_2",
     "day_minus_1",
+]
+
+FUTURE_SLOTS = [
     "today",
     "day_plus_1",
     "day_plus_2",
@@ -26,6 +30,40 @@ SLOTS = [
     "day_plus_5",
     "day_plus_6",
 ]
+
+SLOTS = PAST_SLOTS + FUTURE_SLOTS
+
+# Maps Open-Meteo WMO weather codes to Home Assistant weather condition strings
+WMO_TO_HA_CONDITION: dict[int, str] = {
+    0: "sunny",
+    1: "sunny",
+    2: "partlycloudy",
+    3: "cloudy",
+    45: "fog",
+    48: "fog",
+    51: "rainy",
+    53: "rainy",
+    55: "rainy",
+    56: "snowy-rainy",
+    57: "snowy-rainy",
+    61: "rainy",
+    63: "rainy",
+    65: "pouring",
+    66: "snowy-rainy",
+    67: "snowy-rainy",
+    71: "snowy",
+    73: "snowy",
+    75: "snowy",
+    77: "snowy",
+    80: "rainy",
+    81: "rainy",
+    82: "pouring",
+    85: "snowy",
+    86: "snowy",
+    95: "lightning",
+    96: "lightning-rainy",
+    99: "lightning-rainy",
+}
 
 
 async def async_setup_entry(
@@ -59,19 +97,27 @@ class RollingWeatherSensor(RestoreEntity, SensorEntity):
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
 
+        # Restore persisted history across reboots
         if (last_state := await self.async_get_last_state()) is not None:
             for slot in SLOTS:
-                if slot in last_state.attributes:
-                    self._data[slot] = last_state.attributes[slot]
+                val = last_state.attributes.get(slot)
+                if val and val != "unknown":
+                    self._data[slot] = val
 
+        # Backfill any missing past days via Open-Meteo
+        await self._async_backfill_missing_past_days()
+
+        # Fetch today + future days from the selected HA weather entity
         await self._async_fetch_forecast()
 
+        # Shift days at 00:01:00 daily
         self.async_on_remove(
             async_track_time_change(
                 self.hass, self._async_midnight_shift, hour=0, minute=1, second=0
             )
         )
 
+        # Refresh today + future forecast every hour
         self.async_on_remove(
             async_track_time_interval(
                 self.hass, self._async_hourly_update, timedelta(hours=1)
@@ -85,16 +131,75 @@ class RollingWeatherSensor(RestoreEntity, SensorEntity):
         self._data["day_minus_4"] = self._data.get("day_minus_3")
         self._data["day_minus_3"] = self._data.get("day_minus_2")
         self._data["day_minus_2"] = self._data.get("day_minus_1")
+
         weather_state = self.hass.states.get(self._weather_entity)
         fallback = weather_state.state if weather_state else None
         self._data["day_minus_1"] = self._data.get("today") or fallback
+
+        await self._async_backfill_missing_past_days()
         await self._async_fetch_forecast()
 
     @callback
     async def _async_hourly_update(self, _now) -> None:
         await self._async_fetch_forecast()
 
+    def _resolve_coordinates(self) -> tuple[float | None, float | None]:
+        """Check selected weather entity attributes first, then fall back to hass.config."""
+        weather_state = self.hass.states.get(self._weather_entity)
+        if weather_state is not None:
+            attrs = weather_state.attributes
+            lat = attrs.get("latitude") if attrs.get("latitude") is not None else attrs.get("lat")
+            lon = attrs.get("longitude") if attrs.get("longitude") is not None else attrs.get("lon")
+            if lat is not None and lon is not None:
+                try:
+                    return float(lat), float(lon)
+                except (TypeError, ValueError):
+                    _LOGGER.debug(
+                        "Invalid coordinates on %s (%s, %s); falling back to Home Assistant config",
+                        self._weather_entity,
+                        lat,
+                        lon,
+                    )
+
+        return self.hass.config.latitude, self.hass.config.longitude
+
+    async def _async_backfill_missing_past_days(self) -> None:
+        """Populate only missing past slots using Open-Meteo historical daily codes."""
+        missing_slots = [
+            slot for slot in PAST_SLOTS if not self._data.get(slot) or self._data.get(slot) == "unknown"
+        ]
+        if not missing_slots:
+            return
+
+        lat, lon = self._resolve_coordinates()
+        if lat is None or lon is None:
+            _LOGGER.warning("No coordinates found on %s or Home Assistant config; skipping Open-Meteo backfill", self._weather_entity)
+            return
+
+        url = (
+            "https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lon}"
+            "&daily=weather_code&past_days=6&forecast_days=1&timezone=auto"
+        )
+
+        try:
+            session = async_get_clientsession(self.hass)
+            async with session.get(url, timeout=15) as resp:
+                resp.raise_for_status()
+                payload = await resp.json()
+
+            codes = payload.get("daily", {}).get("weather_code", [])
+            # Open-Meteo returns indices 0..5 for [day_minus_6 .. day_minus_1] and index 6 for today
+            for idx, slot in enumerate(PAST_SLOTS):
+                if (not self._data.get(slot) or self._data.get(slot) == "unknown") and len(codes) > idx:
+                    code = codes[idx]
+                    if code is not None:
+                        self._data[slot] = WMO_TO_HA_CONDITION.get(int(code), "cloudy")
+        except Exception as err:
+            _LOGGER.warning("Failed to backfill past weather from Open-Meteo: %s", err)
+
     async def _async_fetch_forecast(self) -> None:
+        """Fetch today and future daily conditions from the configured HA weather entity."""
         try:
             response = await self.hass.services.async_call(
                 "weather",
@@ -104,16 +209,7 @@ class RollingWeatherSensor(RestoreEntity, SensorEntity):
                 return_response=True,
             )
             forecast = response.get(self._weather_entity, {}).get("forecast", [])
-            future_keys = [
-                "today",
-                "day_plus_1",
-                "day_plus_2",
-                "day_plus_3",
-                "day_plus_4",
-                "day_plus_5",
-                "day_plus_6",
-            ]
-            for idx, key in enumerate(future_keys):
+            for idx, key in enumerate(FUTURE_SLOTS):
                 if len(forecast) > idx:
                     self._data[key] = forecast[idx].get("condition")
         except Exception as err:
